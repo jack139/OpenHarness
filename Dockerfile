@@ -44,4 +44,4 @@ RUN mkdir -p /root/.openharness
 #EXPOSE 18790
 
 ENTRYPOINT ["oh"]
-CMD ["status"]
+CMD ["--version"]
