@@ -1,0 +1,47 @@
+FROM python:3.12-slim-bookworm
+
+# 安装系统依赖
+RUN sed -i 's#deb.debian.org/debian$#mirrors.aliyun.com/debian#' /etc/apt/sources.list.d/debian.sources
+RUN sed -i 's#deb.debian.org/debian-security$#mirrors.aliyun.com/debian-security#' /etc/apt/sources.list.d/debian.sources
+#RUN apt-get update && \
+#    apt-get install -y --no-install-recommends curl ca-certificates gnupg git openssh-client && \
+#    mkdir -p /etc/apt/keyrings && \
+#    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/#keyrings/nodesource.gpg && \
+#    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x #nodistro main" > /etc/apt/sources.list.d/nodesource.list && \
+#    apt-get update && \
+#    apt-get install -y --no-install-recommends nodejs && \
+#    apt-get purge -y gnupg && \
+#    apt-get autoremove -y && \
+#    rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl cron git openssh-client && \
+    which cron && rm -rf /etc/cron.*/* && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python dependencies first (cached layer)
+COPY pyproject.toml.lean ./pyproject.toml
+COPY README.md LICENSE ./
+RUN mkdir -p openharness && touch openharness/__init__.py && \
+    pip install --no-cache-dir -i http://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com --extra-index-url http://mirrors.aliyun.com/pypi/simple/ . && \
+    rm -rf openharness
+
+# Copy the full source and install
+COPY src/openharness/ openharness/
+RUN pip install --no-cache-dir -i http://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com --extra-index-url http://mirrors.aliyun.com/pypi/simple/ .
+
+COPY .agents/ .agents/
+COPY .claude/ .claude/
+
+WORKDIR /app
+
+# Create config directory
+RUN mkdir -p /root/.openharness
+
+# Gateway default port
+#EXPOSE 18790
+
+ENTRYPOINT ["oh"]
+CMD ["status"]
