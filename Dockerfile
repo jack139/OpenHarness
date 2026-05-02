@@ -30,6 +30,7 @@ RUN mkdir -p openharness && touch openharness/__init__.py && \
 
 # Copy the full source and install
 COPY src/openharness/ openharness/
+COPY ohmo/ ohmo/
 RUN pip install --no-cache-dir -i http://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com --extra-index-url http://mirrors.aliyun.com/pypi/simple/ .
 
 COPY .agents/ .agents/
