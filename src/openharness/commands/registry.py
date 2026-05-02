@@ -56,6 +56,7 @@ from openharness.tasks import get_task_manager
 from openharness.plugins.types import PluginCommandDefinition
 
 if TYPE_CHECKING:
+    from openharness.config.settings import ProviderProfile
     from openharness.state import AppStateStore
     from openharness.tools.base import ToolRegistry
 
@@ -75,6 +76,18 @@ class CommandResult:
     submit_model: str | None = None
 
 
+@dataclass(frozen=True)
+class MemoryCommandBackend:
+    """Storage backend used by the generic ``/memory`` slash command."""
+
+    label: str
+    get_memory_dir: Callable[[], Path]
+    get_entrypoint: Callable[[], Path]
+    list_files: Callable[[], list[Path]]
+    add_entry: Callable[[str, str], Path]
+    remove_entry: Callable[[str], bool]
+
+
 @dataclass
 class CommandContext:
     """Context available to command handlers."""
@@ -90,6 +103,8 @@ class CommandContext:
     session_id: str | None = None
     extra_skill_dirs: Iterable[str | Path] | None = None
     extra_plugin_roots: Iterable[str | Path] | None = None
+    memory_backend: MemoryCommandBackend | None = None
+    include_project_memory: bool = True
 
 
 CommandHandler = Callable[[str, CommandContext], Awaitable[CommandResult]]
@@ -104,17 +119,26 @@ class SlashCommand:
     handler: CommandHandler
     remote_invocable: bool = True
     remote_admin_opt_in: bool = False
+    aliases: tuple[str, ...] = ()
 
 
 class CommandRegistry:
     """Map slash commands to handlers."""
 
     def __init__(self) -> None:
+        # Primary commands keyed by canonical name, plus aliases pointing at
+        # the same SlashCommand instance. We keep a separate set of canonical
+        # names so help/listing output doesn't duplicate aliased entries.
         self._commands: dict[str, SlashCommand] = {}
+        self._canonical_names: list[str] = []
 
     def register(self, command: SlashCommand) -> None:
-        """Register a command."""
+        """Register a command, plus any aliases pointing at the same handler."""
+        if command.name not in self._commands:
+            self._canonical_names.append(command.name)
         self._commands[command.name] = command
+        for alias in command.aliases:
+            self._commands[alias] = command
 
     def lookup(self, raw_input: str) -> tuple[SlashCommand, str] | None:
         """Parse a slash command and return its handler plus raw args."""
@@ -129,13 +153,14 @@ class CommandRegistry:
     def help_text(self) -> str:
         """Return a formatted summary of all registered commands."""
         lines = ["Available commands:"]
-        for command in sorted(self._commands.values(), key=lambda item: item.name):
+        commands = [self._commands[name] for name in self._canonical_names]
+        for command in sorted(commands, key=lambda item: item.name):
             lines.append(f"/{command.name:<12} {command.description}")
         return "\n".join(lines)
 
     def list_commands(self) -> list[SlashCommand]:
-        """Return commands in registration order."""
-        return list(self._commands.values())
+        """Return canonical commands in registration order (aliases omitted)."""
+        return [self._commands[name] for name in self._canonical_names]
 
 
 def _run_git_command(cwd: str, *args: str) -> tuple[bool, str]:
@@ -276,7 +301,11 @@ def create_default_command_registry(
 
     async def _context_handler(_: str, context: CommandContext) -> CommandResult:
         settings = load_settings()
-        prompt = build_runtime_system_prompt(settings, cwd=context.cwd)
+        prompt = build_runtime_system_prompt(
+            settings,
+            cwd=context.cwd,
+            include_project_memory=context.include_project_memory,
+        )
         return CommandResult(message=prompt)
 
     async def _summary_handler(args: str, context: CommandContext) -> CommandResult:
@@ -350,7 +379,8 @@ def create_default_command_registry(
 
     async def _stats_handler(_: str, context: CommandContext) -> CommandResult:
         settings = load_settings()
-        memory_count = len(list_memory_files(context.cwd))
+        memory_backend = _memory_backend_for_context(context)
+        memory_count = len(memory_backend.list_files())
         task_count = len(get_task_manager().list_tasks())
         tool_count = len(context.tool_registry.list_tools()) if context.tool_registry is not None else 0
         style = settings.output_style
@@ -370,25 +400,28 @@ def create_default_command_registry(
         )
 
     async def _memory_handler(args: str, context: CommandContext) -> CommandResult:
+        backend = _memory_backend_for_context(context)
         tokens = args.split(maxsplit=1)
         if not tokens:
-            memory_dir = get_project_memory_dir(context.cwd)
-            entrypoint = get_memory_entrypoint(context.cwd)
             return CommandResult(
-                message=f"Memory directory: {memory_dir}\nEntrypoint: {entrypoint}"
+                message=(
+                    f"Memory store: {backend.label}\n"
+                    f"Memory directory: {backend.get_memory_dir()}\n"
+                    f"Entrypoint: {backend.get_entrypoint()}"
+                )
             )
         action = tokens[0]
         rest = tokens[1] if len(tokens) == 2 else ""
         if action == "list":
-            memory_files = list_memory_files(context.cwd)
+            memory_files = backend.list_files()
             if not memory_files:
                 return CommandResult(message="No memory files.")
             return CommandResult(message="\n".join(path.name for path in memory_files))
         if action == "show" and rest:
-            memory_dir = get_project_memory_dir(context.cwd)
+            memory_dir = backend.get_memory_dir()
             path, invalid = _resolve_memory_entry_path(memory_dir, rest)
             if invalid:
-                return CommandResult(message="Memory entry path must stay within the project memory directory.")
+                return CommandResult(message="Memory entry path must stay within the configured memory directory.")
             if path is None:
                 return CommandResult(message=f"Memory entry not found: {rest}")
             if not path.exists():
@@ -398,10 +431,10 @@ def create_default_command_registry(
             title, separator, content = rest.partition("::")
             if not separator or not title.strip() or not content.strip():
                 return CommandResult(message="Usage: /memory add TITLE :: CONTENT")
-            path = add_memory_entry(context.cwd, title.strip(), content.strip())
+            path = backend.add_entry(title.strip(), content.strip())
             return CommandResult(message=f"Added memory entry {path.name}")
         if action == "remove" and rest:
-            if remove_memory_entry(context.cwd, rest.strip()):
+            if backend.remove_entry(rest.strip()):
                 return CommandResult(message=f"Removed memory entry {rest.strip()}")
             return CommandResult(message=f"Memory entry not found: {rest.strip()}")
         return CommandResult(message="Usage: /memory [list|show NAME|add TITLE :: CONTENT|remove NAME]")
@@ -498,7 +531,11 @@ def create_default_command_registry(
             snapshot_path = context.session_backend.save_snapshot(
                 cwd=context.cwd,
                 model=context.app_state.get().model if context.app_state is not None else load_settings().model,
-                system_prompt=build_runtime_system_prompt(load_settings(), cwd=context.cwd),
+                system_prompt=build_runtime_system_prompt(
+                    load_settings(),
+                    cwd=context.cwd,
+                    include_project_memory=context.include_project_memory,
+                ),
                 messages=context.engine.messages,
                 usage=context.engine.total_usage,
             )
@@ -843,7 +880,13 @@ def create_default_command_registry(
             return CommandResult(message="Usage: /effort [show|low|medium|high]")
         settings.effort = value
         save_settings(settings)
-        context.engine.set_system_prompt(build_runtime_system_prompt(settings, cwd=context.cwd))
+        context.engine.set_system_prompt(
+            build_runtime_system_prompt(
+                settings,
+                cwd=context.cwd,
+                include_project_memory=context.include_project_memory,
+            )
+        )
         if context.app_state is not None:
             context.app_state.set(effort=value)
         return CommandResult(message=f"Reasoning effort set to {value}.")
@@ -860,7 +903,13 @@ def create_default_command_registry(
             return CommandResult(message="Usage: /passes [show|COUNT]")
         settings.passes = passes
         save_settings(settings)
-        context.engine.set_system_prompt(build_runtime_system_prompt(settings, cwd=context.cwd))
+        context.engine.set_system_prompt(
+            build_runtime_system_prompt(
+                settings,
+                cwd=context.cwd,
+                include_project_memory=context.include_project_memory,
+            )
+        )
         if context.app_state is not None:
             context.app_state.set(passes=passes)
         return CommandResult(message=f"Pass count set to {passes}.")
@@ -1041,7 +1090,11 @@ def create_default_command_registry(
             path = install_plugin_from_path(tokens[1])
             return CommandResult(message=f"Installed plugin to {path}")
         if tokens[0] == "uninstall" and len(tokens) == 2:
-            if uninstall_plugin(tokens[1]):
+            try:
+                removed = uninstall_plugin(tokens[1])
+            except ValueError:
+                return CommandResult(message=f"Invalid plugin name '{tokens[1]}'")
+            if removed:
                 return CommandResult(message=f"Uninstalled plugin '{tokens[1]}'")
             return CommandResult(message=f"Plugin '{tokens[1]}' not found")
         plugins = load_plugins(settings, context.cwd, extra_roots=context.extra_plugin_roots)
@@ -1098,6 +1151,36 @@ def create_default_command_registry(
             return CommandResult(message="Plan mode disabled.", refresh_runtime=True)
         return CommandResult(message="Usage: /plan [on|off]")
 
+    def _dedupe_model_values(values: Iterable[str]) -> list[str]:
+        models: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            model = value.strip()
+            if not model or model in seen:
+                continue
+            models.append(model)
+            seen.add(model)
+        return models
+
+    def _seed_model_values(profile: "ProviderProfile") -> list[str]:
+        existing = _dedupe_model_values(profile.allowed_models)
+        if existing:
+            return existing
+        return _dedupe_model_values([display_model_setting(profile)])
+
+    def _format_model_status(active_profile: str, profile: "ProviderProfile") -> str:
+        lines = [
+            f"Model: {display_model_setting(profile)}",
+            f"Profile: {active_profile}",
+        ]
+        if profile.allowed_models:
+            lines.append("Available models:")
+            lines.extend(f"- {model}" for model in profile.allowed_models)
+        else:
+            lines.append("Available models: unrestricted for this profile")
+            lines.append("Use /model add MODEL to pin switchable models for the TUI selector.")
+        return "\n".join(lines)
+
     async def _model_handler(args: str, context: CommandContext) -> CommandResult:
         settings = load_settings()
         manager = AuthManager(settings)
@@ -1105,7 +1188,62 @@ def create_default_command_registry(
         _, profile = settings.resolve_profile(active_profile)
         tokens = args.split(maxsplit=1)
         if not tokens or tokens[0] == "show":
-            return CommandResult(message=f"Model: {display_model_setting(profile)}\nProfile: {active_profile}")
+            return CommandResult(message=_format_model_status(active_profile, profile))
+        if tokens[0] == "list":
+            if profile.allowed_models:
+                return CommandResult(
+                    message=(
+                        f"Switchable models for profile '{active_profile}':\n"
+                        + "\n".join(f"- {model}" for model in profile.allowed_models)
+                    )
+                )
+            return CommandResult(
+                message=(
+                    f"Profile '{active_profile}' has no pinned model list. "
+                    "Any model value is accepted. Use /model add MODEL to add one."
+                )
+            )
+        if tokens[0] == "add" and len(tokens) == 2:
+            model_name = tokens[1].strip()
+            models = _dedupe_model_values([*_seed_model_values(profile), model_name])
+            if not model_name:
+                return CommandResult(message="Usage: /model add MODEL")
+            manager.update_profile(active_profile, allowed_models=models)
+            return CommandResult(
+                message=f"Added model '{model_name}' to profile '{active_profile}'.",
+                refresh_runtime=True,
+            )
+        if tokens[0] == "add":
+            return CommandResult(message="Usage: /model add MODEL")
+        if tokens[0] in {"remove", "rm"} and len(tokens) == 2:
+            model_name = tokens[1].strip()
+            models = [model for model in _dedupe_model_values(profile.allowed_models) if model != model_name]
+            if len(models) == len(_dedupe_model_values(profile.allowed_models)):
+                return CommandResult(message=f"Model '{model_name}' is not pinned for profile '{active_profile}'.")
+            reset_current = (profile.last_model or "").strip() == model_name
+            manager.update_profile(
+                active_profile,
+                allowed_models=models,
+                last_model="" if reset_current else None,
+            )
+            updated = load_settings()
+            if reset_current:
+                context.engine.set_model(updated.model)
+                if context.app_state is not None:
+                    updated_profile = updated.resolve_profile()[1]
+                    context.app_state.set(model=display_model_setting(updated_profile))
+            return CommandResult(
+                message=f"Removed model '{model_name}' from profile '{active_profile}'.",
+                refresh_runtime=True,
+            )
+        if tokens[0] in {"remove", "rm"}:
+            return CommandResult(message="Usage: /model remove MODEL")
+        if tokens[0] == "clear":
+            manager.update_profile(active_profile, allowed_models=[])
+            return CommandResult(
+                message=f"Cleared pinned models for profile '{active_profile}'. Any model value is now accepted.",
+                refresh_runtime=True,
+            )
         if tokens[0] == "set" and len(tokens) == 2:
             model_name = tokens[1].strip()
         elif args.strip():
@@ -1128,7 +1266,7 @@ def create_default_command_registry(
                 updated_profile = updated.resolve_profile()[1]
                 context.app_state.set(model=display_model_setting(updated_profile))
             return CommandResult(message=message, refresh_runtime=True)
-        return CommandResult(message="Usage: /model [show|MODEL]")
+        return CommandResult(message="Usage: /model [show|list|add MODEL|remove MODEL|clear|MODEL]")
 
     async def _provider_handler(args: str, context: CommandContext) -> CommandResult:
         manager = AuthManager()
@@ -1810,7 +1948,9 @@ def create_default_command_registry(
         )
 
     registry.register(SlashCommand("help", "Show available commands", _help_handler))
-    registry.register(SlashCommand("exit", "Exit OpenHarness", _exit_handler))
+    registry.register(
+        SlashCommand("exit", "Exit OpenHarness", _exit_handler, aliases=("quit",))
+    )
     registry.register(SlashCommand("clear", "Clear conversation history", _clear_handler))
     registry.register(SlashCommand("version", "Show the installed OpenHarness version", _version_handler))
     registry.register(SlashCommand("status", "Show session status", _status_handler))
@@ -1831,7 +1971,15 @@ def create_default_command_registry(
     registry.register(SlashCommand("rewind", "Remove the latest conversation turn(s)", _rewind_handler))
     registry.register(SlashCommand("files", "List files in the current workspace", _files_handler))
     registry.register(SlashCommand("init", "Initialize project OpenHarness files", _init_handler))
-    registry.register(SlashCommand("bridge", "Inspect bridge helpers and spawn bridge sessions", _bridge_handler))
+    registry.register(
+        SlashCommand(
+            "bridge",
+            "Inspect bridge helpers and spawn bridge sessions",
+            _bridge_handler,
+            remote_invocable=False,
+            remote_admin_opt_in=True,
+        )
+    )
     registry.register(SlashCommand("login", "Show auth status or store an API key", _login_handler))
     registry.register(SlashCommand("logout", "Clear the stored API key", _logout_handler))
     registry.register(SlashCommand("feedback", "Save CLI feedback to the local feedback log", _feedback_handler))
@@ -1881,7 +2029,7 @@ def create_default_command_registry(
     registry.register(SlashCommand("turns", "Show or update maximum agentic turn count", _turns_handler))
     registry.register(SlashCommand("continue", "Continue the previous tool loop if it was interrupted", _continue_handler))
     registry.register(SlashCommand("provider", "Show or switch provider profiles", _provider_handler))
-    registry.register(SlashCommand("model", "Show or update the default model", _model_handler))
+    registry.register(SlashCommand("model", "Show, switch, or manage profile models", _model_handler))
     registry.register(SlashCommand("theme", "List, set, show or preview TUI themes", _theme_handler))
     registry.register(SlashCommand("output-style", "Show or update output style", _output_style_handler))
     registry.register(SlashCommand("keybindings", "Show resolved keybindings", _keybindings_handler))
@@ -1957,6 +2105,22 @@ def _resolve_memory_entry_path(memory_dir: Path, candidate: str) -> tuple[Path |
         if slugged is not None and slugged.exists():
             return slugged, False
     return None, False
+
+
+def _memory_backend_for_context(context: CommandContext) -> MemoryCommandBackend:
+    """Return the active slash-command memory backend for this command context."""
+
+    if context.memory_backend is not None:
+        return context.memory_backend
+    cwd = context.cwd
+    return MemoryCommandBackend(
+        label="OpenHarness project memory",
+        get_memory_dir=lambda: get_project_memory_dir(cwd),
+        get_entrypoint=lambda: get_memory_entrypoint(cwd),
+        list_files=lambda: list_memory_files(cwd),
+        add_entry=lambda title, content: add_memory_entry(cwd, title, content),
+        remove_entry=lambda name: remove_memory_entry(cwd, name),
+    )
 
 
 def _resolve_memory_candidate(memory_dir: Path, candidate: str) -> tuple[Path | None, bool]:

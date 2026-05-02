@@ -131,6 +131,24 @@ async def test_reload_plugins_command_supports_explicit_remote_admin_opt_in(tmp_
 
 
 @pytest.mark.asyncio
+async def test_bridge_command_is_marked_local_only(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    registry = create_default_command_registry()
+    command, _ = registry.lookup("/bridge spawn id")
+    assert command is not None
+    assert command.remote_invocable is False
+
+
+@pytest.mark.asyncio
+async def test_bridge_command_supports_explicit_remote_admin_opt_in(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    registry = create_default_command_registry()
+    command, _ = registry.lookup("/bridge spawn id")
+    assert command is not None
+    assert getattr(command, "remote_admin_opt_in", False) is True
+
+
+@pytest.mark.asyncio
 async def test_memory_show_rejects_path_traversal(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
     monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
@@ -140,7 +158,7 @@ async def test_memory_show_rejects_path_traversal(tmp_path: Path, monkeypatch):
 
     result = await command.handler(args, CommandContext(engine=_make_engine(tmp_path), cwd=str(tmp_path)))
 
-    assert result.message == "Memory entry path must stay within the project memory directory."
+    assert result.message == "Memory entry path must stay within the configured memory directory."
 
 
 @pytest.mark.asyncio
@@ -184,6 +202,155 @@ async def test_model_command_accepts_direct_value(tmp_path: Path, monkeypatch):
 
     assert "gpt-5.4" in result.message
     assert load_settings().model == "gpt-5.4"
+
+
+@pytest.mark.asyncio
+async def test_model_command_lists_profile_model_allowlist(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    save_settings(
+        Settings().model_copy(
+            update={
+                "active_profile": "local-llm",
+                "provider": "openai",
+                "api_format": "openai",
+                "base_url": "http://localhost:8000/v1",
+                "model": "deepseek-chat",
+                "profiles": {
+                    "local-llm": {
+                        "label": "Local LLM",
+                        "provider": "openai",
+                        "api_format": "openai",
+                        "auth_source": "openai_api_key",
+                        "default_model": "deepseek-chat",
+                        "last_model": "deepseek-chat",
+                        "base_url": "http://localhost:8000/v1",
+                        "allowed_models": ["deepseek-chat", "qwen-vl"],
+                    }
+                },
+            }
+        )
+    )
+    registry = create_default_command_registry()
+    command, args = registry.lookup("/model list")
+    assert command is not None
+
+    result = await command.handler(args, CommandContext(engine=_make_engine(tmp_path), cwd=str(tmp_path)))
+
+    assert "Switchable models for profile 'local-llm'" in result.message
+    assert "- deepseek-chat" in result.message
+    assert "- qwen-vl" in result.message
+
+
+@pytest.mark.asyncio
+async def test_model_command_adds_model_to_profile_allowlist(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    save_settings(
+        Settings().model_copy(
+            update={
+                "active_profile": "local-llm",
+                "provider": "openai",
+                "api_format": "openai",
+                "base_url": "http://localhost:8000/v1",
+                "model": "deepseek-chat",
+                "profiles": {
+                    "local-llm": {
+                        "label": "Local LLM",
+                        "provider": "openai",
+                        "api_format": "openai",
+                        "auth_source": "openai_api_key",
+                        "default_model": "deepseek-chat",
+                        "last_model": "deepseek-chat",
+                        "base_url": "http://localhost:8000/v1",
+                        "allowed_models": ["deepseek-chat"],
+                    }
+                },
+            }
+        )
+    )
+    registry = create_default_command_registry()
+    command, args = registry.lookup("/model add qwen-vl")
+    assert command is not None
+
+    result = await command.handler(args, CommandContext(engine=_make_engine(tmp_path), cwd=str(tmp_path)))
+
+    assert result.refresh_runtime is True
+    assert load_settings().resolve_profile()[1].allowed_models == ["deepseek-chat", "qwen-vl"]
+
+
+@pytest.mark.asyncio
+async def test_model_command_remove_current_model_resets_to_default(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    save_settings(
+        Settings().model_copy(
+            update={
+                "active_profile": "local-llm",
+                "provider": "openai",
+                "api_format": "openai",
+                "base_url": "http://localhost:8000/v1",
+                "model": "qwen-vl",
+                "profiles": {
+                    "local-llm": {
+                        "label": "Local LLM",
+                        "provider": "openai",
+                        "api_format": "openai",
+                        "auth_source": "openai_api_key",
+                        "default_model": "deepseek-chat",
+                        "last_model": "qwen-vl",
+                        "base_url": "http://localhost:8000/v1",
+                        "allowed_models": ["deepseek-chat", "qwen-vl"],
+                    }
+                },
+            }
+        )
+    )
+    registry = create_default_command_registry()
+    context = _make_context(tmp_path)
+    command, args = registry.lookup("/model remove qwen-vl")
+    assert command is not None
+
+    result = await command.handler(args, context)
+
+    profile = load_settings().resolve_profile()[1]
+    assert result.refresh_runtime is True
+    assert profile.allowed_models == ["deepseek-chat"]
+    assert profile.last_model == ""
+    assert context.engine.model == "deepseek-chat"
+
+
+@pytest.mark.asyncio
+async def test_model_command_clear_removes_profile_allowlist(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    save_settings(
+        Settings().model_copy(
+            update={
+                "active_profile": "local-llm",
+                "provider": "openai",
+                "api_format": "openai",
+                "base_url": "http://localhost:8000/v1",
+                "model": "deepseek-chat",
+                "profiles": {
+                    "local-llm": {
+                        "label": "Local LLM",
+                        "provider": "openai",
+                        "api_format": "openai",
+                        "auth_source": "openai_api_key",
+                        "default_model": "deepseek-chat",
+                        "last_model": "deepseek-chat",
+                        "base_url": "http://localhost:8000/v1",
+                        "allowed_models": ["deepseek-chat", "qwen-vl"],
+                    }
+                },
+            }
+        )
+    )
+    registry = create_default_command_registry()
+    command, args = registry.lookup("/model clear")
+    assert command is not None
+
+    result = await command.handler(args, CommandContext(engine=_make_engine(tmp_path), cwd=str(tmp_path)))
+
+    assert result.refresh_runtime is True
+    assert load_settings().resolve_profile()[1].allowed_models == []
 
 
 @pytest.mark.asyncio
@@ -841,3 +1008,27 @@ async def test_git_commands_report_repository_state(tmp_path: Path, monkeypatch)
     commit_command, commit_args = registry.lookup("/commit initial commit")
     commit_result = await commit_command.handler(commit_args, context)
     assert "commit" in commit_result.message.lower()
+
+
+def test_quit_is_alias_for_exit():
+    """Regression for #183: /quit should resolve to the same handler as /exit."""
+    reg = create_default_command_registry()
+
+    exit_cmd, _ = reg.lookup("/exit")
+    quit_cmd, _ = reg.lookup("/quit")
+
+    assert exit_cmd is quit_cmd
+    assert quit_cmd.name == "exit"
+
+
+def test_help_and_list_do_not_duplicate_aliases():
+    """Aliases share a SlashCommand object; help/listing must not repeat it."""
+    reg = create_default_command_registry()
+
+    names = [cmd.name for cmd in reg.list_commands()]
+    assert names.count("exit") == 1
+    assert "quit" not in names  # alias is resolvable via lookup, not listed
+
+    help_text = reg.help_text()
+    assert help_text.count("/exit ") == 1
+    assert "/quit" not in help_text
