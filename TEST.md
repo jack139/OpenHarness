@@ -22,8 +22,8 @@ vim ./runtime/.openharness/settings.json
 
 ```bash
 # Or run a single command
-docker run -v ./runtime/.openharness:/root/.openharness --rm openharness -p "hello"
+docker run -v ./runtime:/root --rm openharness -p "hello"
 
 # for test
-docker run -it -v ./runtime/.openharness:/root/.openharness --rm --entrypoint bash openharness
+docker run -it -v ./runtime:/root --rm --entrypoint bash openharness
 ```
